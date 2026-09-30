@@ -143,7 +143,7 @@ function top_k_por_pod(df::DataFrame, k::Int)
     partes = DataFrame[]
     for g in groupby(df, :COD_LOCAL_DESTINOS)
         sel = DataFrame(first(g, k))
-        sel.RANK_NO_POD = collect(1:nrow(sel))
+        sel.RANK_NO_POD = collect(1:nrow(sel)) # CORRIGIDO: volta a iniciar do 1
         push!(partes, sel)
     end
     return reduce(vcat, partes)
@@ -207,8 +207,6 @@ function aplicar_heuristica(df_locais::DataFrame, df_rotas::DataFrame)
     df_validas = filter(row -> row.V_EF >= row.MIN_INTAKE, df_processado)
 
     # ---------------- PODs DEPENDENTES ----------------
-    # POD sem nenhuma linha válida E com MIN_INTAKE > CALADO_DWT em alguma rota
-    # => depende de outros destinos (o navio descarrega antes e só depois vai a ele).
     com_rota   = Set(df_processado.COD_LOCAL_DESTINOS)
     aprovados  = Set(df_validas.COD_LOCAL_DESTINOS)
     reprovados = setdiff(com_rota, aprovados)
@@ -241,28 +239,22 @@ function aplicar_heuristica(df_locais::DataFrame, df_rotas::DataFrame)
             length(unique(df_sel_normais.COD_LOCAL_DESTINOS)), " de ", length(aprovados))
 
     # ---------------- TRATAMENTO DOS DEPENDENTES ----------------
-    # Cada dependente precisa aparecer em pelo menos K rotas DISTINTAS entre as escolhidas.
-    # Se aparecer em n < K, a heurística escolhe as K - n rotas restantes para ele.
     ids_escolhidas    = Set{Int}(df_sel_normais._ROTA_ID)
-    rotas_com_nao_dep = Set(df_validas._ROTA_ID)  # rotas com >= 1 destino não dependente viável
+    rotas_com_nao_dep = Set(df_validas._ROTA_ID)
 
-    # Candidatas dos dependentes: a restrição V_EF >= MIN_INTAKE é dispensada para eles,
-    # mas a rota é obrigada a ter outro destino não dependente e viável.
     df_dep_all = filter(
         r -> (r.COD_LOCAL_DESTINOS in dependentes) && (r._ROTA_ID in rotas_com_nao_dep),
         df_processado
     )
     if nrow(df_dep_all) > 0
         adicionar_metricas!(df_dep_all)
-        aplicar_scores!(df_dep_all, limites)   # mesmos limites, para scores comparáveis
+        aplicar_scores!(df_dep_all, limites)
     end
 
-    # Nº de rotas distintas (entre as escolhidas) em que o POD aparece na lista de destinos
     contar_aparicoes(pod, ids) = length(unique(
         df_expandido[(df_expandido.COD_LOCAL_DESTINOS .== pod) .& in.(df_expandido._ROTA_ID, Ref(ids)), :_ROTA_ID]
     ))
 
-    # Processa primeiro os dependentes com menos rotas candidatas (mais restritos)
     n_candidatas(pod) = nrow(df_dep_all) == 0 ? 0 :
         length(unique(df_dep_all[df_dep_all.COD_LOCAL_DESTINOS .== pod, :_ROTA_ID]))
     ordem_dep = sort(collect(dependentes); by = p -> (n_candidatas(p), p))
@@ -278,7 +270,6 @@ function aplicar_heuristica(df_locais::DataFrame, df_rotas::DataFrame)
             continue
         end
 
-        # candidatas ainda não escolhidas, 1 linha por rota
         mascara = (df_dep_all.COD_LOCAL_DESTINOS .== pod) .& .!in.(df_dep_all._ROTA_ID, Ref(ids_escolhidas))
         cand = DataFrame(df_dep_all[mascara, :])
         if nrow(cand) > 0
@@ -287,6 +278,12 @@ function aplicar_heuristica(df_locais::DataFrame, df_rotas::DataFrame)
         end
 
         sel = top_k_por_pod(cand, falta)
+        
+        # CORRIGIDO: O deslocamento do rank dos dependentes é aplicado aqui!
+        if nrow(sel) > 0
+            sel.RANK_NO_POD = collect((ja + 1):(ja + nrow(sel)))
+        end
+        
         sel.DEPENDENTE = fill(true, nrow(sel))
 
         println("Dependente ", pod, ": aparece em ", ja, " rota(s); faltavam ", falta,
@@ -297,7 +294,7 @@ function aplicar_heuristica(df_locais::DataFrame, df_rotas::DataFrame)
 
         if nrow(sel) > 0
             push!(partes_dep, sel)
-            union!(ids_escolhidas, sel._ROTA_ID)   # essas rotas já contam para os próximos dependentes
+            union!(ids_escolhidas, sel._ROTA_ID)
         end
     end
 
@@ -314,13 +311,11 @@ function aplicar_heuristica(df_locais::DataFrame, df_rotas::DataFrame)
     # SAÍDAS
     # --------------------------------------------------------------------------
 
-    # Rótulo: POD(#posição no ranking do POD); "*" indica POD dependente
     df_selecionadas.DEST_LABEL = [
         string(r.COD_LOCAL_DESTINOS, "(#", r.RANK_NO_POD, ")", r.DEPENDENTE ? "*" : "")
         for r in eachrow(df_selecionadas)
     ]
 
-    # Tabela 1: Agrupada por rota (1 linha por rota selecionada, via _ROTA_ID)
     cols_identificadoras = [:_ROTA_ID, :COD_ARMADOR, :COD_LOCAL_ORIGENS, :MIN_INTAKE, :MAX_INTAKE,
                             :FRETE_POR_TON, :TEMPO_IDA, :TEMPO_IDA_VOLTA, :QTD_DEST_ROTA]
 
@@ -330,11 +325,11 @@ function aplicar_heuristica(df_locais::DataFrame, df_rotas::DataFrame)
         nrow => :QTD_DESTINOS_ATENDIDOS
     )
 
-    # Tabela 2: linhas originais das rotas selecionadas
     ids_rotas_otimas = sort(unique(df_selecionadas._ROTA_ID))
     df_rotas_otimas_cruas = df_rotas[ids_rotas_otimas, :]
 
-    return df_visao_agrupada, df_rotas_otimas_cruas
+    # CORRIGIDO: Retorna também o df_selecionadas para o CSV do Solver
+    return df_visao_agrupada, df_rotas_otimas_cruas, df_selecionadas
 end
 
 # ==============================================================================
@@ -370,7 +365,9 @@ else
 end
 
 println("\nCalculando rotas ótimas (K = $(K_ROTAS_POR_POD) por POD)...")
-df_agrupada, df_crua = aplicar_heuristica(df_locais_in, df_rotas_in)
+
+# CORRIGIDO: Agora recebe as 3 tabelas retornadas
+df_agrupada, df_crua, df_solver = aplicar_heuristica(df_locais_in, df_rotas_in)
 
 println("\n", "="^100)
 println("1. VISÃO AGRUPADA POR ROTA (POD(#posição) = rota está entre as K melhores do POD; * = POD dependente):")
@@ -387,3 +384,6 @@ println("\n")
 CSV.write("Saida_Visao_Agrupada.csv", df_agrupada)
 CSV.write("Saida_Tabela_Crua.csv", df_crua)
 println("-> Os resultados foram exportados para 'Saida_Visao_Agrupada.csv' e 'Saida_Tabela_Crua.csv'")
+
+CSV.write("Saida_Pares_Rota_POD_Solver.csv", df_solver)
+println("-> Matriz de decisão exportada para 'Saida_Pares_Rota_POD_Solver.csv'")
