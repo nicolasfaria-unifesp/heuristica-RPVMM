@@ -1,5 +1,6 @@
 using DataFrames
 using CSV
+using Statistics
 
 # ==============================================================================
 # CONFIGURAÇÕES E PARÂMETROS
@@ -8,6 +9,13 @@ using CSV
 CAMINHO_TABELA_LOCAIS = "MDLocais.csv"
 CAMINHO_TABELA_ROTAS  = "MDArmadorRotas.csv"
 
+# Quantidade de melhores rotas que cada POD seleciona (K >= 1)
+K_ROTAS_POR_POD = 3
+
+# Faixa central dos dados usada como min/max na normalização (0.95 = percentis 2.5% a 97.5%).
+# Valores abaixo do min viram 0 e acima do max viram 1.
+PERCENTIL_CENTRAL = 0.95
+
 # Pesos da Função Multicritério (Alfa + Beta + Gama + Delta = 1.0)
 ALFA  = 0.40  # Peso do Frete Efetivo
 BETA  = 0.25  # Peso do Tempo de Ida
@@ -15,6 +23,8 @@ GAMA  = 0.15  # Peso do Tempo de Volta
 DELTA = 0.20  # Peso da Quantidade de Destinos da Rota (mais destinos = melhor)
 
 @assert isapprox(ALFA + BETA + GAMA + DELTA, 1.0) "Os pesos devem somar 1.0"
+@assert K_ROTAS_POR_POD >= 1 "K deve ser >= 1"
+@assert 0 < PERCENTIL_CENTRAL <= 1 "PERCENTIL_CENTRAL deve estar em (0, 1]"
 
 # Separadores aceitos entre destinos dentro de uma mesma rota
 SEPARADOR_DESTINOS = r"[;,|]"
@@ -63,6 +73,80 @@ function separar_destinos(d)
     else
         return [strip(String(d))]
     end
+end
+
+# --- Métricas por linha (rota x POD) ---
+function adicionar_metricas!(df::DataFrame)
+    if nrow(df) == 0
+        df.FRETE_EFETIVO = Float64[]
+        df.T_IDA = Float64[]
+        df.T_VOLTA = Float64[]
+        return df
+    end
+    df.FRETE_EFETIVO = [
+        calcular_frete_efetivo(r.V_EF, r.MAX_INTAKE, r.FRETE_POR_TON)
+        for r in eachrow(df)
+    ]
+    df.T_IDA   = df.TEMPO_IDA
+    df.T_VOLTA = df.TEMPO_IDA_VOLTA .- df.TEMPO_IDA
+    return df
+end
+
+# --- Limites robustos (min/max dentro da faixa central de percentis) ---
+function limites_robustos(v)
+    cauda = (1 - PERCENTIL_CENTRAL) / 2
+    q = quantile(Float64.(v), [cauda, 1 - cauda])
+    return (q[1], q[2])
+end
+
+# Normaliza para [0,1] usando limites robustos; fora da faixa -> 0 ou 1 (clamp)
+function normalizar(x, lim; inverter::Bool = false)
+    lo, hi = lim
+    hi == lo && return 0.0
+    n = clamp((x - lo) / (hi - lo), 0.0, 1.0)
+    return inverter ? 1.0 - n : n
+end
+
+# Calcula os limites a partir de um conjunto de referência (as linhas válidas)
+function calcular_limites(df::DataFrame)
+    return (
+        frete = limites_robustos(df.FRETE_EFETIVO),
+        t_ida = limites_robustos(df.T_IDA),
+        t_volta = limites_robustos(df.T_VOLTA),
+        qtd = limites_robustos(df.QTD_DEST_ROTA),
+    )
+end
+
+# Aplica a normalização e calcula o score (menor = melhor)
+function aplicar_scores!(df::DataFrame, lim)
+    df.CUSTO_NORM     = [normalizar(x, lim.frete) for x in df.FRETE_EFETIVO]
+    df.T_IDA_NORM     = [normalizar(x, lim.t_ida) for x in df.T_IDA]
+    df.T_VOLTA_NORM   = [normalizar(x, lim.t_volta) for x in df.T_VOLTA]
+    # invertido: mais destinos -> 0 (melhor), menos destinos -> 1 (pior)
+    df.QTD_DEST_NORM  = [normalizar(x, lim.qtd; inverter = true) for x in df.QTD_DEST_ROTA]
+
+    df.SCORE = (ALFA  .* df.CUSTO_NORM) .+
+               (BETA  .* df.T_IDA_NORM) .+
+               (GAMA  .* df.T_VOLTA_NORM) .+
+               (DELTA .* df.QTD_DEST_NORM)
+    return df
+end
+
+# Seleciona as K melhores rotas (menor score) para cada POD
+function top_k_por_pod(df::DataFrame, k::Int)
+    if nrow(df) == 0
+        vazio = similar(df, 0)
+        vazio.RANK_NO_POD = Int[]
+        return vazio
+    end
+    sort!(df, [:COD_LOCAL_DESTINOS, :SCORE])
+    partes = DataFrame[]
+    for g in groupby(df, :COD_LOCAL_DESTINOS)
+        sel = DataFrame(first(g, k))
+        sel.RANK_NO_POD = collect(1:nrow(sel))
+        push!(partes, sel)
+    end
+    return reduce(vcat, partes)
 end
 
 # ==============================================================================
@@ -122,70 +206,132 @@ function aplicar_heuristica(df_locais::DataFrame, df_rotas::DataFrame)
     # 5. Restrições Físicas
     df_validas = filter(row -> row.V_EF >= row.MIN_INTAKE, df_processado)
 
-    # ---------------- DIAGNÓSTICO 2: reprovados pela restrição física ----------------
+    # ---------------- PODs DEPENDENTES ----------------
+    # POD sem nenhuma linha válida E com MIN_INTAKE > CALADO_DWT em alguma rota
+    # => depende de outros destinos (o navio descarrega antes e só depois vai a ele).
     com_rota   = Set(df_processado.COD_LOCAL_DESTINOS)
     aprovados  = Set(df_validas.COD_LOCAL_DESTINOS)
     reprovados = setdiff(com_rota, aprovados)
-    println("PODs reprovados só por V_EF < MIN_INTAKE: ", length(reprovados), " -> ", sort(collect(reprovados)))
+
+    dependentes = Set{String}(
+        r.COD_LOCAL_DESTINOS for r in eachrow(df_processado)
+        if (r.COD_LOCAL_DESTINOS in reprovados) && (r.CALADO_DWT < r.MIN_INTAKE)
+    )
+    inviaveis_outros = setdiff(reprovados, dependentes)
+
+    println("PODs dependentes (MIN_INTAKE > CALADO): ", length(dependentes), " -> ", sort(collect(dependentes)))
+    println("PODs inviáveis por outros motivos (estoque/intake): ", length(inviaveis_outros), " -> ", sort(collect(inviaveis_outros)))
 
     if nrow(df_validas) == 0
         error("Nenhuma rota viável encontrada após aplicar as restrições físicas.")
     end
 
     # 6. Frete Efetivo e Tempos
-    df_validas.FRETE_EFETIVO = [
-        calcular_frete_efetivo(row.V_EF, row.MAX_INTAKE, row.FRETE_POR_TON)
-        for row in eachrow(df_validas)
-    ]
+    adicionar_metricas!(df_validas)
 
-    df_validas.T_IDA   = df_validas.TEMPO_IDA
-    df_validas.T_VOLTA = df_validas.TEMPO_IDA_VOLTA .- df_validas.TEMPO_IDA
+    # 7. Normalização robusta (percentis) + 8. Score Multicritério
+    limites = calcular_limites(df_validas)
+    aplicar_scores!(df_validas, limites)
 
-    # 7. Normalização Min-Max (0 a 1)
-    min_f, max_f   = extrema(df_validas.FRETE_EFETIVO)
-    min_ti, max_ti = extrema(df_validas.T_IDA)
-    min_tv, max_tv = extrema(df_validas.T_VOLTA)
-    min_qd, max_qd = extrema(df_validas.QTD_DEST_ROTA)
+    # 9. K melhores rotas para CADA POD (não dependente)
+    df_sel_normais = top_k_por_pod(df_validas, K_ROTAS_POR_POD)
+    df_sel_normais.DEPENDENTE = fill(false, nrow(df_sel_normais))
 
-    norm_f(x)  = max_f == min_f ? 0.0 : (x - min_f) / (max_f - min_f)
-    norm_ti(x) = max_ti == min_ti ? 0.0 : (x - min_ti) / (max_ti - min_ti)
-    norm_tv(x) = max_tv == min_tv ? 0.0 : (x - min_tv) / (max_tv - min_tv)
-    # invertido: mais destinos -> 0 (melhor), menos destinos -> 1 (pior)
-    norm_qd(x) = max_qd == min_qd ? 0.0 : (max_qd - x) / (max_qd - min_qd)
+    println("PODs atendidos pela heurística (não dependentes): ",
+            length(unique(df_sel_normais.COD_LOCAL_DESTINOS)), " de ", length(aprovados))
 
-    df_validas.CUSTO_NORM   = norm_f.(df_validas.FRETE_EFETIVO)
-    df_validas.T_IDA_NORM   = norm_ti.(df_validas.T_IDA)
-    df_validas.T_VOLTA_NORM = norm_tv.(df_validas.T_VOLTA)
-    df_validas.QTD_DEST_NORM = norm_qd.(df_validas.QTD_DEST_ROTA)
+    # ---------------- TRATAMENTO DOS DEPENDENTES ----------------
+    # Cada dependente precisa aparecer em pelo menos K rotas DISTINTAS entre as escolhidas.
+    # Se aparecer em n < K, a heurística escolhe as K - n rotas restantes para ele.
+    ids_escolhidas    = Set{Int}(df_sel_normais._ROTA_ID)
+    rotas_com_nao_dep = Set(df_validas._ROTA_ID)  # rotas com >= 1 destino não dependente viável
 
-    # 8. Score Multicritério
-    df_validas.SCORE = (ALFA .* df_validas.CUSTO_NORM) .+
-                       (BETA .* df_validas.T_IDA_NORM) .+
-                       (GAMA .* df_validas.T_VOLTA_NORM) .+
-                       (DELTA .* df_validas.QTD_DEST_NORM)
+    # Candidatas dos dependentes: a restrição V_EF >= MIN_INTAKE é dispensada para eles,
+    # mas a rota é obrigada a ter outro destino não dependente e viável.
+    df_dep_all = filter(
+        r -> (r.COD_LOCAL_DESTINOS in dependentes) && (r._ROTA_ID in rotas_com_nao_dep),
+        df_processado
+    )
+    if nrow(df_dep_all) > 0
+        adicionar_metricas!(df_dep_all)
+        aplicar_scores!(df_dep_all, limites)   # mesmos limites, para scores comparáveis
+    end
 
-    # 9. Rota de menor score para CADA destino (POD)
-    sort!(df_validas, [:COD_LOCAL_DESTINOS, :SCORE])
-    df_selecionadas_puras = unique(df_validas, :COD_LOCAL_DESTINOS)
+    # Nº de rotas distintas (entre as escolhidas) em que o POD aparece na lista de destinos
+    contar_aparicoes(pod, ids) = length(unique(
+        df_expandido[(df_expandido.COD_LOCAL_DESTINOS .== pod) .& in.(df_expandido._ROTA_ID, Ref(ids)), :_ROTA_ID]
+    ))
 
-    println("PODs atendidos pela heurística: ", nrow(df_selecionadas_puras), " de ", length(pods))
+    # Processa primeiro os dependentes com menos rotas candidatas (mais restritos)
+    n_candidatas(pod) = nrow(df_dep_all) == 0 ? 0 :
+        length(unique(df_dep_all[df_dep_all.COD_LOCAL_DESTINOS .== pod, :_ROTA_ID]))
+    ordem_dep = sort(collect(dependentes); by = p -> (n_candidatas(p), p))
+
+    partes_dep = DataFrame[]
+    incompletos = String[]
+
+    for pod in ordem_dep
+        ja    = contar_aparicoes(pod, ids_escolhidas)
+        falta = K_ROTAS_POR_POD - ja
+        if falta <= 0
+            println("Dependente ", pod, ": já aparece em ", ja, " rota(s) escolhida(s) (>= K). OK.")
+            continue
+        end
+
+        # candidatas ainda não escolhidas, 1 linha por rota
+        mascara = (df_dep_all.COD_LOCAL_DESTINOS .== pod) .& .!in.(df_dep_all._ROTA_ID, Ref(ids_escolhidas))
+        cand = DataFrame(df_dep_all[mascara, :])
+        if nrow(cand) > 0
+            sort!(cand, :SCORE)
+            unique!(cand, :_ROTA_ID)
+        end
+
+        sel = top_k_por_pod(cand, falta)
+        sel.DEPENDENTE = fill(true, nrow(sel))
+
+        println("Dependente ", pod, ": aparece em ", ja, " rota(s); faltavam ", falta,
+                " -> heurística escolheu ", nrow(sel))
+        if nrow(sel) < falta
+            push!(incompletos, pod)
+        end
+
+        if nrow(sel) > 0
+            push!(partes_dep, sel)
+            union!(ids_escolhidas, sel._ROTA_ID)   # essas rotas já contam para os próximos dependentes
+        end
+    end
+
+    if !isempty(incompletos)
+        println("ATENÇÃO: dependentes que não atingiram K rotas (faltam rotas com outro destino não dependente): ",
+                sort(incompletos))
+    end
+
+    df_sel_dep = isempty(partes_dep) ? similar(df_sel_normais, 0) : reduce(vcat, partes_dep)
+
+    df_selecionadas = vcat(df_sel_normais, df_sel_dep)
 
     # --------------------------------------------------------------------------
     # SAÍDAS
     # --------------------------------------------------------------------------
 
-    # Tabela 1: Agrupada por rota (1 linha por rota vencedora, via _ROTA_ID)
+    # Rótulo: POD(#posição no ranking do POD); "*" indica POD dependente
+    df_selecionadas.DEST_LABEL = [
+        string(r.COD_LOCAL_DESTINOS, "(#", r.RANK_NO_POD, ")", r.DEPENDENTE ? "*" : "")
+        for r in eachrow(df_selecionadas)
+    ]
+
+    # Tabela 1: Agrupada por rota (1 linha por rota selecionada, via _ROTA_ID)
     cols_identificadoras = [:_ROTA_ID, :COD_ARMADOR, :COD_LOCAL_ORIGENS, :MIN_INTAKE, :MAX_INTAKE,
                             :FRETE_POR_TON, :TEMPO_IDA, :TEMPO_IDA_VOLTA, :QTD_DEST_ROTA]
 
     df_visao_agrupada = combine(
-        groupby(df_selecionadas_puras, cols_identificadoras),
-        :COD_LOCAL_DESTINOS => (d -> join(sort(unique(d)), ", ")) => :DESTINOS_ONDE_E_OTIMA,
+        groupby(df_selecionadas, cols_identificadoras),
+        :DEST_LABEL => (d -> join(sort(d), ", ")) => :DESTINOS_ONDE_E_TOP_K,
         nrow => :QTD_DESTINOS_ATENDIDOS
     )
 
-    # Tabela 2: linhas originais das rotas campeãs
-    ids_rotas_otimas = unique(df_selecionadas_puras._ROTA_ID)
+    # Tabela 2: linhas originais das rotas selecionadas
+    ids_rotas_otimas = sort(unique(df_selecionadas._ROTA_ID))
     df_rotas_otimas_cruas = df_rotas[ids_rotas_otimas, :]
 
     return df_visao_agrupada, df_rotas_otimas_cruas
@@ -223,17 +369,17 @@ else
     )
 end
 
-println("\nCalculando rotas ótimas...")
+println("\nCalculando rotas ótimas (K = $(K_ROTAS_POR_POD) por POD)...")
 df_agrupada, df_crua = aplicar_heuristica(df_locais_in, df_rotas_in)
 
 println("\n", "="^100)
-println("1. VISÃO AGRUPADA POR ROTA (DESTINOS ONDE A ROTA FOI SELECIONADA COMO ÓTIMA):")
+println("1. VISÃO AGRUPADA POR ROTA (POD(#posição) = rota está entre as K melhores do POD; * = POD dependente):")
 println("="^100)
 show(stdout, df_agrupada, allrows=true, allcols=true, truncate=0)
 println("\n")
 
 println("="^100)
-println("2. TABELA ORIGINAL CRUA (ROTAS VENCEDORAS COM TODOS OS SEUS DESTINOS POSSÍVEIS):")
+println("2. TABELA ORIGINAL CRUA (ROTAS SELECIONADAS COM TODOS OS SEUS DESTINOS POSSÍVEIS):")
 println("="^100)
 show(stdout, df_crua, allrows=true, allcols=true, truncate=0)
 println("\n")
