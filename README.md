@@ -6,6 +6,8 @@ Para **cada POD** (porto de destino) do `MDLocais.csv`, escolher as **K melhores
 
 PODs que não comportam o volume mínimo da rota por causa do calado são tratados como **dependentes** (seção 5): eles só são atendidos como parada adicional de uma rota que já entrega em outro porto. Cada dependente também precisa aparecer em pelo menos K rotas escolhidas.
 
+Além das tabelas de leitura, o código exporta um CSV com todos os pares (rota, POD) selecionados e suas métricas, pensado como entrada para um solver (seção 6).
+
 ## 2. Entradas
 
 **MDLocais.csv**: `COD_LOCAL, MAX_CARREGAMENTO, MAX_DESCARREGAMENTO, MAX_ESTOQUE, CALADO_DWT, TIPO`
@@ -23,7 +25,7 @@ Só `COD_LOCAL`, `TIPO`, `MAX_ESTOQUE` e `CALADO_DWT` entram no cálculo.
 | Parâmetro | Padrão | Significado |
 |---|---|---|
 | `K_ROTAS_POR_POD` | 3 | Quantas rotas cada POD escolhe (deve ser ≥ 1). Também é o mínimo de aparições de cada dependente. |
-| `PERCENTIL_CENTRAL` | 0,95 | Faixa central dos dados usada como min/max na normalização (percentis 2,5% a 97,5%). |
+| `PERCENTIL_CENTRAL` | 0,95 | Faixa central dos dados usada como min/max na normalização (percentis 2,5% a 97,5%). Deve estar em (0, 1]. |
 
 Pesos do score (devem somar 1,0; há um `@assert`):
 
@@ -40,7 +42,7 @@ Pesos do score (devem somar 1,0; há um `@assert`):
 2. **Explosão dos destinos.** Cada rota é separada em uma linha por destino. Antes disso, registra `QTD_DEST_ROTA`, o número de destinos da rota como listada.
 3. **Junção com MDLocais.** Cada par (rota, destino) recebe `MAX_ESTOQUE` e `CALADO_DWT` do POD. Destinos que não existem no MDLocais são descartados.
 4. **Carga efetiva.** `V_EF = min(MAX_INTAKE, CALADO_DWT, MAX_ESTOQUE)`: o maior volume que o navio consegue descarregar naquele POD.
-5. **Filtro físico.** Mantém só os pares com `V_EF >= MIN_INTAKE`. Se o POD não comporta nem o mínimo da rota, o par é inviável.
+5. **Filtro físico.** Mantém só os pares com `V_EF >= MIN_INTAKE`. Se o POD não comporta nem o mínimo da rota, o par é inviável. Se nenhum par sobrar, o código para com erro.
 6. **Classificação dos PODs reprovados.** Veja a seção 5.
 7. **Frete efetivo.** O frete base tem desconto progressivo por faixa da capacidade (`MAX_INTAKE`):
 
@@ -65,9 +67,9 @@ Pesos do score (devem somar 1,0; há um `@assert`):
     SCORE = ALFA·frete_norm + BETA·t_ida_norm + GAMA·t_volta_norm + DELTA·destinos_norm
     ```
     Quanto menor, melhor.
-11. **Seleção Top-K.** Para cada POD não dependente, ordena por score e fica com as K rotas de menor valor (ou todas, se tiver menos de K). A posição no ranking do POD é guardada como `RANK_NO_POD`.
+11. **Seleção Top-K.** Para cada POD não dependente, ordena por score e fica com as K rotas de menor valor (ou todas, se tiver menos de K). A posição no ranking do POD é guardada como `RANK_NO_POD`, começando em 1.
 12. **Tratamento dos dependentes.** Veja a seção 5.
-13. **Saídas.** Duas tabelas e dois CSVs (seção 6).
+13. **Saídas.** Duas tabelas de leitura e um CSV de pares para o solver (seção 6).
 
 ## 5. PODs dependentes
 
@@ -79,28 +81,40 @@ A ideia é que o navio entrega a carga em outros portos primeiro, fica mais leve
 
 **Fluxo.**
 1. A heurística roda normalmente (passos 7 a 11), sem os dependentes.
-2. Para cada dependente, conta-se em quantas rotas **distintas**, entre as já escolhidas, ele aparece na lista de destinos.
-3. Se aparece em `n ≥ K` rotas, está ok.
-4. Se `n < K`, o dependente passa pela heurística para pegar as `K − n` rotas que faltam, com estas regras:
+2. Para cada dependente, conta-se em quantas rotas **distintas**, entre as já escolhidas, ele aparece na lista de destinos (`ja`).
+3. Se `ja ≥ K`, está ok.
+4. Se `ja < K`, o dependente passa pela heurística para pegar as `K − ja` rotas que faltam, com estas regras:
    - a restrição `V_EF >= MIN_INTAKE` é dispensada para ele;
    - a rota precisa ter pelo menos um **outro destino não dependente** e fisicamente viável;
-   - rotas já escolhidas não são repetidas;
+   - rotas já escolhidas não são repetidas (uma linha por rota);
    - o score usa os **mesmos limites de normalização** dos PODs normais, então os valores são comparáveis.
 5. Os dependentes são processados do mais restrito (menos rotas candidatas) para o menos restrito. As rotas que um dependente adiciona já contam para os seguintes.
 6. Se não houver rotas suficientes, o dependente fica com as que existirem e o código avisa no console com "ATENÇÃO".
+
+**Numeração do ranking.** Para dependentes, `RANK_NO_POD` continua depois das aparições que ele já tinha. Exemplo com `K = 3` e `ja = 1`: a heurística escolhe 2 rotas, rotuladas `#2` e `#3`. A posição `#1` corresponde à rota que já o cobria e que não recebe rótulo (ela foi escolhida por causa de outro POD).
 
 **Premissa.** O frete efetivo do dependente é calculado com o `V_EF` dele (menor que o `MIN_INTAKE`), não com o volume real que o navio levaria depois de descarregar nos outros portos.
 
 ## 6. Como ler as saídas
 
+A função `aplicar_heuristica` devolve três tabelas.
+
 **Tabela 1: `Saida_Visao_Agrupada.csv`.** Uma linha por rota selecionada (agrupada por `_ROTA_ID`).
-- `DESTINOS_ONDE_E_TOP_K`: PODs em que essa rota ficou entre as K melhores, no formato `POD(#posição)`. A posição é o ranking da rota dentro daquele POD. Um `*` no final marca POD dependente (ex.: `POD3(#1)*`).
+- `DESTINOS_ONDE_E_TOP_K`: PODs em que essa rota ficou entre as K melhores, no formato `POD(#posição)`. A posição é o ranking da rota dentro daquele POD. Um `*` no final marca POD dependente (ex.: `POD3(#2)*`).
 - `QTD_DESTINOS_ATENDIDOS`: quantos PODs aparecem nessa coluna.
 - `QTD_DEST_ROTA`: quantos destinos a rota tem no total.
 
-Para dependentes, a posição `#` vale só entre as rotas escolhidas pela heurística para ele. Rotas que já o cobriam por acaso não recebem o rótulo `POD(#n)*`, mas aparecem na Tabela 2 com o destino na lista completa.
+Rotas que cobrem um dependente por acaso (escolhidas por causa de outro POD) não trazem o rótulo dele na Tabela 1, mas o destino aparece na lista completa da Tabela 2.
 
 **Tabela 2: `Saida_Tabela_Crua.csv`.** As mesmas rotas, como estão no arquivo original: destinos completos com `;` e frete como texto. Tem o mesmo número de linhas da Tabela 1, mas na ordem do arquivo original (a Tabela 1 segue a ordem da seleção).
+
+**Tabela 3: `Saida_Pares_Rota_POD_Solver.csv`.** Uma linha por par (rota, POD) selecionado, com todas as colunas do cálculo. Serve como matriz de decisão para o solver. Entre as colunas estão:
+- identificação: `_ROTA_ID`, `COD_ARMADOR`, `COD_LOCAL_ORIGENS`, `COD_LOCAL_DESTINOS` (o POD da linha), `QTD_DEST_ROTA`;
+- dados da rota e do POD: `MIN_INTAKE`, `MAX_INTAKE`, `FRETE_POR_TON`, `TEMPO_IDA`, `TEMPO_IDA_VOLTA`, `MAX_ESTOQUE`, `CALADO_DWT`, `V_EF`;
+- métricas: `FRETE_EFETIVO`, `T_IDA`, `T_VOLTA`, os valores normalizados (`CUSTO_NORM`, `T_IDA_NORM`, `T_VOLTA_NORM`, `QTD_DEST_NORM`) e `SCORE`;
+- seleção: `RANK_NO_POD`, `DEPENDENTE` (verdadeiro ou falso) e `DEST_LABEL`.
+
+Um mesmo POD aparece em até K linhas (para dependentes, em até K − `ja` linhas), e uma mesma rota aparece em várias linhas quando é selecionada por mais de um POD.
 
 `FRETE_POR_TON` nas tabelas é o frete **base**. O score usa o frete **efetivo**, que é menor por causa dos descontos por faixa.
 
